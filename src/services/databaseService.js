@@ -189,9 +189,57 @@ class DatabaseService {
 
   async listClasificaciones() {
     const { rows } = await pool.query(
-      'SELECT id, codigo, nombre, descripcion, requiere_plano FROM dt_clasificaciones ORDER BY orden'
+      `SELECT id, codigo, nombre, descripcion, requiere_plano,
+              categoria, tipo_categoria, emisor, vigencia_dias, orden
+         FROM dt_clasificaciones
+        ORDER BY orden`
     );
     return rows;
+  }
+
+  /* ──────────────────── DOCUMENTOS SOLICITADOS ──────────────────── */
+
+  async listDocumentosSolicitados(folio) {
+    const { rows } = await pool.query(
+      `SELECT
+         ds.id_solicitud,
+         ds.trigger_id,
+         ds.motivo,
+         ds.matched_phrase,
+         ds.estado,
+         ds.fecha_creacion,
+         ds.fecha_resolucion,
+         c.codigo            AS codigo_solicitado,
+         c.nombre            AS nombre_solicitado,
+         c.categoria,
+         c.emisor,
+         a_origen.id_archivo AS id_archivo_origen,
+         a_origen.nombre     AS nombre_archivo_origen,
+         a_resuelto.id_archivo AS id_archivo_resuelto,
+         a_resuelto.nombre   AS nombre_archivo_resuelto
+       FROM dt_documentos_solicitados ds
+       JOIN dt_estudio e          ON e.id_estudio = ds.id_estudio
+       JOIN dt_clasificaciones c  ON c.id = ds.id_clasificacion
+       LEFT JOIN dt_archivos a_origen   ON a_origen.id_archivo = ds.id_archivo_origen
+       LEFT JOIN dt_archivos a_resuelto ON a_resuelto.id_archivo = ds.id_archivo_resuelto
+       WHERE e.folio = $1
+       ORDER BY ds.fecha_creacion DESC`,
+      [folio]
+    );
+    return rows;
+  }
+
+  async updateSolicitudEstado(idSolicitud, estado, idArchivoResuelto = null) {
+    const { rows } = await pool.query(
+      `UPDATE dt_documentos_solicitados
+          SET estado = $2,
+              id_archivo_resuelto = $3,
+              fecha_resolucion = CASE WHEN $2 IN ('subido','descartado') THEN NOW() ELSE NULL END
+        WHERE id_solicitud = $1
+        RETURNING *`,
+      [idSolicitud, estado, idArchivoResuelto]
+    );
+    return rows[0] || null;
   }
 
   async listEstados() {

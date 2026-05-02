@@ -103,4 +103,35 @@ router.delete('/:folio/archivos/:fileId', async (req, res) => {
   }
 });
 
+// Documentos que el sistema le solicitó al cliente (gatillados por triggers IF/THEN
+// del clasificador). UI los muestra como "te falta subir X por la condición Y".
+router.get('/:folio/documentos-solicitados', async (req, res) => {
+  try {
+    const data = await databaseService.listDocumentosSolicitados(req.params.folio);
+    res.status(200).json({ status: 'success', data, count: data.length });
+  } catch (err) {
+    loggingService.error('Error listing documentos solicitados', {
+      folio: req.params.folio, error: err.message,
+    });
+    res.status(500).json({ status: 'error', code: 'LIST_SOLICITADOS_FAILED', message: err.message });
+  }
+});
+
+router.patch('/:folio/documentos-solicitados/:idSolicitud', async (req, res) => {
+  try {
+    const { estado, id_archivo_resuelto } = req.body;
+    if (!['pendiente', 'subido', 'descartado'].includes(estado)) {
+      return res.status(400).json({ status: 'error', code: 'BAD_ESTADO', message: 'estado inválido' });
+    }
+    const updated = await databaseService.updateSolicitudEstado(
+      req.params.idSolicitud, estado, id_archivo_resuelto || null,
+    );
+    if (!updated) return res.status(404).json({ status: 'error', code: 'NOT_FOUND', message: 'Solicitud no encontrada' });
+    res.status(200).json({ status: 'success', data: updated });
+  } catch (err) {
+    loggingService.error('Error updating solicitud', { error: err.message });
+    res.status(500).json({ status: 'error', code: 'UPDATE_SOLICITUD_FAILED', message: err.message });
+  }
+});
+
 module.exports = router;
