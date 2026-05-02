@@ -103,6 +103,184 @@ router.delete('/:folio/archivos/:fileId', async (req, res) => {
   }
 });
 
+// Stats de revisión humana de las clasificaciones (usado por la UI para
+// habilitar/deshabilitar el botón "Procesar todo").
+router.get('/:folio/revision-stats', async (req, res) => {
+  try {
+    const stats = await databaseService.getArchivosRevisionStats(req.params.folio);
+    const total = parseInt(stats.total, 10) || 0;
+    const aprobados = parseInt(stats.aprobados, 10) || 0;
+    const procesable = total > 0 && aprobados === total;
+    res.status(200).json({
+      status: 'success',
+      data: { ...stats, total, aprobados, procesable },
+    });
+  } catch (err) {
+    loggingService.error('revision-stats failed', { error: err.message });
+    res.status(500).json({ status: 'error', code: 'STATS_FAILED', message: err.message });
+  }
+});
+
+// Helper compartido: procesa un archivo llamando a documentos-api/extract-from-gcs.
+// Marca estado en BBDD (extrayendo → procesado/error). Devuelve resumen.
+async function procesarArchivo(req, archivo, folio) {
+  const config = require('../../../config');
+  await databaseService.markArchivoExtrayendo(archivo.id_archivo);
+  const url = `${config.documentosApiUrl.replace(/\/$/, '')}/extract-from-gcs`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), config.documentosApiTimeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
+      },
+      body: JSON.stringify({
+        tipo: archivo.clasificacion_codigo,
+        folio,
+        gcs_path: archivo.gcs_path,
+        id_archivo: archivo.id_archivo,
+      }),
+      signal: ctrl.signal,
+    });
+    const ok = resp.ok;
+    await databaseService.markArchivoProcesado(archivo.id_archivo, ok);
+    return { id_archivo: archivo.id_archivo, nombre: archivo.nombre, ok, status: resp.status };
+  } catch (e) {
+    await databaseService.markArchivoProcesado(archivo.id_archivo, false);
+    return { id_archivo: archivo.id_archivo, nombre: archivo.nombre, ok: false, error: e.message };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// "Procesar todo el expediente": orquesta extracciones documentos-api por cada
+// archivo aprobado. NO requiere reclasificar: usa la clasificación confirmada.
+//
+// Patrón fire-and-forget (A1): responde 202 inmediato y corre el loop en background.
+// Requiere Cloud Run con --no-cpu-throttling para que la CPU siga después del 202.
+// El frontend hace polling de revision-stats / listArchivos para ver el progreso.
+router.post('/:folio/procesar', async (req, res) => {
+  const folio = req.params.folio;
+  try {
+    const stats = await databaseService.getArchivosRevisionStats(folio);
+    const total = parseInt(stats.total, 10) || 0;
+    const aprobados = parseInt(stats.aprobados, 10) || 0;
+    if (total === 0) {
+      return res.status(400).json({ status: 'error', code: 'SIN_ARCHIVOS', message: 'El estudio no tiene archivos.' });
+    }
+    if (aprobados !== total) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'REVISION_INCOMPLETA',
+        message: `Hay ${total - aprobados} archivo(s) sin aprobar. Revísalos antes de procesar.`,
+      });
+    }
+
+    const config = require('../../../config');
+    if (!config.documentosApiUrl) {
+      return res.status(500).json({
+        status: 'error',
+        code: 'DOCAPI_NO_CONFIGURADO',
+        message: 'DOCUMENTOS_API_URL no configurada en estudios-service.',
+      });
+    }
+
+    const archivos = await databaseService.listArchivosListosParaExtraer(folio);
+    if (archivos.length === 0) {
+      return res.status(200).json({
+        status: 'success',
+        data: { folio, total: 0, mensaje: 'Nada nuevo para procesar (todos los aprobados ya están procesados).' },
+      });
+    }
+
+    // Capturamos el bearer ahora; res.send libera el request pero el header sigue
+    // disponible como string en la closure.
+    const authHeader = req.headers.authorization;
+
+    // Marcamos TODO como 'extrayendo' antes de responder, para que el frontend
+    // ya vea el estado correcto en su próximo polling.
+    for (const a of archivos) {
+      await databaseService.markArchivoExtrayendo(a.id_archivo);
+    }
+
+    // Respondemos 202 al toque
+    res.status(202).json({
+      status: 'success',
+      code: 'PROCESAMIENTO_INICIADO',
+      data: {
+        folio,
+        total: archivos.length,
+        mensaje: 'Procesamiento iniciado en background. Hacé polling de revision-stats / listArchivos para ver el progreso.',
+      },
+    });
+
+    // Loop en background — fire and forget.
+    // Cada error de archivo se persiste en BBDD; un error inesperado del loop
+    // se loggea pero no rompe la instancia.
+    setImmediate(async () => {
+      const minimalReq = { headers: { authorization: authHeader } };
+      try {
+        for (const a of archivos) {
+          await procesarArchivo(minimalReq, a, folio);
+        }
+        loggingService.info('procesamiento background OK', { folio, total: archivos.length });
+      } catch (e) {
+        loggingService.error('procesamiento background falló', { folio, error: e.message });
+      }
+    });
+  } catch (err) {
+    loggingService.error('procesar estudio failed', { folio, error: err.message });
+    res.status(500).json({ status: 'error', code: 'PROCESAR_FAILED', message: err.message });
+  }
+});
+
+// Limpieza manual: archivos atascados en 'extrayendo' por más de N minutos
+// (default 15) se marcan como 'error' para que el letrado pueda reintentarlos.
+// Se llama automáticamente al arrancar la instancia (loaders/index.js) y a mano.
+router.post('/:folio/limpiar-extrayendo', async (req, res) => {
+  try {
+    const minutos = parseInt(req.query.minutos, 10) || 15;
+    const limpiados = await databaseService.resetArchivosAtascados(req.params.folio, minutos);
+    res.status(200).json({ status: 'success', data: { folio: req.params.folio, limpiados, minutos } });
+  } catch (err) {
+    res.status(500).json({ status: 'error', code: 'LIMPIAR_FAILED', message: err.message });
+  }
+});
+
+// Reprocesar UN archivo (útil cuando una extracción falló o se quiere re-correr
+// después de cambiar el tipo). Permite re-procesar incluso si ya está en 'procesado'.
+router.post('/:folio/archivos/:fileId/procesar', async (req, res) => {
+  const folio = req.params.folio;
+  const fileId = parseInt(req.params.fileId, 10);
+  try {
+    const config = require('../../../config');
+    if (!config.documentosApiUrl) {
+      return res.status(500).json({
+        status: 'error',
+        code: 'DOCAPI_NO_CONFIGURADO',
+        message: 'DOCUMENTOS_API_URL no configurada en estudios-service.',
+      });
+    }
+
+    const a = await databaseService.getArchivoParaExtraer(folio, fileId);
+    if (!a) {
+      return res.status(404).json({
+        status: 'error',
+        code: 'NOT_FOUND',
+        message: 'Archivo no encontrado, o sin clasificación, o sin aprobación humana.',
+      });
+    }
+
+    const resultado = await procesarArchivo(req, a, folio);
+    res.status(200).json({ status: 'success', data: resultado });
+  } catch (err) {
+    loggingService.error('reprocesar archivo failed', { folio, fileId, error: err.message });
+    res.status(500).json({ status: 'error', code: 'REPROCESAR_FAILED', message: err.message });
+  }
+});
+
 // Documentos que el sistema le solicitó al cliente (gatillados por triggers IF/THEN
 // del clasificador). UI los muestra como "te falta subir X por la condición Y".
 router.get('/:folio/documentos-solicitados', async (req, res) => {

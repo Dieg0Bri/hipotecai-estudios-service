@@ -197,6 +197,111 @@ class DatabaseService {
     return rows;
   }
 
+  /* ──────────────────── PIPELINE DE PROCESAMIENTO ──────────────────── */
+
+  // Devuelve los archivos del estudio listos para extracción:
+  // estado_revision='aprobado', estado_procesamiento NO en ('extrayendo','procesado'),
+  // y con id_clasificacion seteado.
+  async listArchivosListosParaExtraer(folio) {
+    const { rows } = await pool.query(
+      `SELECT a.id_archivo, a.nombre, a.gcs_path, cl.codigo AS clasificacion_codigo
+       FROM dt_archivos a
+       JOIN dt_estudio e        ON e.id_estudio = a.id_estudio
+       JOIN dt_clasificaciones cl ON cl.id = a.id_clasificacion
+       WHERE e.folio = $1
+         AND a.eliminado = FALSE
+         AND a.estado_revision = 'aprobado'
+         AND a.estado_procesamiento NOT IN ('extrayendo','procesado')`,
+      [folio]
+    );
+    return rows;
+  }
+
+  // Devuelve un archivo concreto si existe, está aprobado y tiene clasificación.
+  // Usado por el endpoint de reprocesamiento individual.
+  async getArchivoParaExtraer(folio, idArchivo) {
+    const { rows } = await pool.query(
+      `SELECT a.id_archivo, a.nombre, a.gcs_path, cl.codigo AS clasificacion_codigo
+       FROM dt_archivos a
+       JOIN dt_estudio e        ON e.id_estudio = a.id_estudio
+       JOIN dt_clasificaciones cl ON cl.id = a.id_clasificacion
+       WHERE e.folio = $1
+         AND a.id_archivo = $2
+         AND a.eliminado = FALSE
+         AND a.estado_revision = 'aprobado'`,
+      [folio, idArchivo]
+    );
+    return rows[0] || null;
+  }
+
+  // Marca un archivo como 'extrayendo'. Permite reprocesar archivos en estado
+  // 'procesado' o 'error' — solo bloquea si ya está corriendo (otra ejecución
+  // en paralelo).
+  async markArchivoExtrayendo(idArchivo) {
+    await pool.query(
+      `UPDATE dt_archivos SET estado_procesamiento='extrayendo', fecha_actualizacion=NOW()
+       WHERE id_archivo=$1 AND estado_procesamiento != 'extrayendo'`,
+      [idArchivo]
+    );
+  }
+
+  async markArchivoProcesado(idArchivo, ok = true) {
+    await pool.query(
+      `UPDATE dt_archivos SET estado_procesamiento=$2, fecha_actualizacion=NOW()
+       WHERE id_archivo=$1`,
+      [idArchivo, ok ? 'procesado' : 'error']
+    );
+  }
+
+  // Recovery: archivos en 'extrayendo' por más de N minutos se asumen como
+  // huérfanos (la instancia que los procesaba murió). Los marcamos 'error'
+  // para que el letrado pueda reintentarlos manualmente.
+  // Si folio es null, barre todos los estudios.
+  async resetArchivosAtascados(folio, minutos = 15) {
+    const interval = `${parseInt(minutos, 10) || 15} minutes`;
+    if (folio) {
+      const { rowCount } = await pool.query(
+        `UPDATE dt_archivos a
+         SET estado_procesamiento = 'error',
+             observacion = COALESCE(a.observacion, '') || ' [recovery: instancia caída]',
+             fecha_actualizacion = NOW()
+         FROM dt_estudio e
+         WHERE e.id_estudio = a.id_estudio
+           AND e.folio = $1
+           AND a.estado_procesamiento = 'extrayendo'
+           AND a.fecha_actualizacion < NOW() - INTERVAL '${interval}'`,
+        [folio]
+      );
+      return rowCount;
+    }
+    const { rowCount } = await pool.query(
+      `UPDATE dt_archivos
+       SET estado_procesamiento = 'error',
+           observacion = COALESCE(observacion, '') || ' [recovery: instancia caída]',
+           fecha_actualizacion = NOW()
+       WHERE estado_procesamiento = 'extrayendo'
+         AND fecha_actualizacion < NOW() - INTERVAL '${interval}'`
+    );
+    return rowCount;
+  }
+
+  // Para chequeos de "todos están aprobados" antes de habilitar el botón.
+  async getArchivosRevisionStats(folio) {
+    const { rows } = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE a.eliminado = FALSE)                          AS total,
+         COUNT(*) FILTER (WHERE a.eliminado = FALSE AND a.estado_revision = 'aprobado')   AS aprobados,
+         COUNT(*) FILTER (WHERE a.eliminado = FALSE AND a.estado_revision = 'pendiente')  AS pendientes,
+         COUNT(*) FILTER (WHERE a.eliminado = FALSE AND a.estado_revision = 'observado')  AS observados,
+         COUNT(*) FILTER (WHERE a.eliminado = FALSE AND a.estado_revision = 'rechazado')  AS rechazados
+       FROM dt_archivos a
+       JOIN dt_estudio e ON e.id_estudio = a.id_estudio
+       WHERE e.folio = $1`,
+      [folio]
+    );
+    return rows[0] || { total: 0, aprobados: 0, pendientes: 0, observados: 0, rechazados: 0 };
+  }
+
   /* ──────────────────── DOCUMENTOS SOLICITADOS ──────────────────── */
 
   async listDocumentosSolicitados(folio) {

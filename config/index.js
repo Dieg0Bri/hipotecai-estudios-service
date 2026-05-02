@@ -17,6 +17,11 @@ module.exports = {
   googleClientId: process.env.GOOGLE_CLIENT_ID,
   apiGatewayUrl: process.env.API_GATEWAY_URL,
 
+  // URL del documentos-api para orquestar extracciones desde /procesar
+  documentosApiUrl: process.env.DOCUMENTOS_API_URL,
+  // Timeout por extracción (ms). Cada extracción puede tardar en Gemini.
+  documentosApiTimeoutMs: parseInt(process.env.DOCUMENTOS_API_TIMEOUT_MS, 10) || 90_000,
+
   allowedOrigins: (process.env.ALLOWED_ORIGINS
     || 'http://localhost:3030,http://localhost:3000,http://127.0.0.1:3030').split(','),
 
