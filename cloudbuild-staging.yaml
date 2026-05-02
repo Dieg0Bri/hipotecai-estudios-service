@@ -26,6 +26,9 @@ steps:
       - '--memory=512Mi'
       - '--cpu=1'
       - '--max-instances=5'
+      # Timeout extendido para que /procesar pueda correr 27 archivos × ~30s
+      # con paralelismo (queda en ~3-5 min). Default es 300s, aquí: 30 min.
+      - '--timeout=1800'
 
 images:
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:latest'
@@ -47,6 +50,6 @@ substitutions:
   _DB_PORT: '5432'
   _DB_PASSWORD_SECRET: 'db-password'
   _GOOGLE_CLIENT_ID: ''
-  _ALLOWED_ORIGINS: 'http://localhost:3030'
+  _ALLOWED_ORIGINS: 'https://frontend-dev-thsmcpbjwa-tl.a.run.app,http://localhost:3030'
   _GCS_BUCKET_DOCUMENTOS: 'hipotecai-documentos-dev'
   _DOCUMENTOS_API_URL: ''

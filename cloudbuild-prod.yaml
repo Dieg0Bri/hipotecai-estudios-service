@@ -27,8 +27,8 @@ steps:
       - '--cpu=1'
       - '--max-instances=10'
       # min-instances queda en 0 (default) — V0 sin costos fijos.
-      # CPU always allocated: necesario para el loop background de /procesar
-      - '--no-cpu-throttling'
+      # Timeout extendido para /procesar (paralelismo 5 sobre ~27 archivos).
+      - '--timeout=1800'
 
 images:
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/${_SERVICE_NAME}:latest'

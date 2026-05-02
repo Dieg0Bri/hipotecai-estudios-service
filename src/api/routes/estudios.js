@@ -121,6 +121,22 @@ router.get('/:folio/revision-stats', async (req, res) => {
   }
 });
 
+// Helper de concurrencia limitada (sin dependencias). Procesa items con
+// `mapper` paralelizando `concurrency` workers a la vez. Resultados en orden.
+async function pMap(items, mapper, concurrency) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array(Math.min(concurrency, items.length)).fill(null).map(async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await mapper(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 // Helper compartido: procesa un archivo llamando a documentos-api/extract-from-gcs.
 // Marca estado en BBDD (extrayendo → procesado/error). Devuelve resumen.
 async function procesarArchivo(req, archivo, folio) {
@@ -155,12 +171,15 @@ async function procesarArchivo(req, archivo, folio) {
   }
 }
 
-// "Procesar todo el expediente": orquesta extracciones documentos-api por cada
-// archivo aprobado. NO requiere reclasificar: usa la clasificación confirmada.
+// "Procesar todo el expediente" (síncrono).
 //
-// Patrón fire-and-forget (A1): responde 202 inmediato y corre el loop en background.
-// Requiere Cloud Run con --no-cpu-throttling para que la CPU siga después del 202.
-// El frontend hace polling de revision-stats / listArchivos para ver el progreso.
+// Para flujos típicos el FRONTEND prefiere iterar archivo por archivo via
+// POST /:folio/archivos/:fileId/procesar — esto da progreso en vivo y evita
+// el timeout de Cloud Run con muchos archivos.
+//
+// Este endpoint queda como atajo para llamadas directas (CLI, testing) con
+// pocos archivos. Si excede el timeout default de Cloud Run, falla parcial:
+// la BBDD persiste el progreso, los pendientes quedan 'aprobado' para reintentar.
 router.post('/:folio/procesar', async (req, res) => {
   const folio = req.params.folio;
   try {
@@ -188,47 +207,14 @@ router.post('/:folio/procesar', async (req, res) => {
     }
 
     const archivos = await databaseService.listArchivosListosParaExtraer(folio);
-    if (archivos.length === 0) {
-      return res.status(200).json({
-        status: 'success',
-        data: { folio, total: 0, mensaje: 'Nada nuevo para procesar (todos los aprobados ya están procesados).' },
-      });
-    }
-
-    // Capturamos el bearer ahora; res.send libera el request pero el header sigue
-    // disponible como string en la closure.
-    const authHeader = req.headers.authorization;
-
-    // Marcamos TODO como 'extrayendo' antes de responder, para que el frontend
-    // ya vea el estado correcto en su próximo polling.
-    for (const a of archivos) {
-      await databaseService.markArchivoExtrayendo(a.id_archivo);
-    }
-
-    // Respondemos 202 al toque
-    res.status(202).json({
+    // Paralelo con concurrencia 5: 27 archivos × 30s ≈ 3 min total (en serie
+    // serían 13.5 min y excederían el timeout de Cloud Run). Si Gemini empieza
+    // a rate-limitar, bajar a 3.
+    const resultados = await pMap(archivos, (a) => procesarArchivo(req, a, folio), 5);
+    const exitosos = resultados.filter((r) => r.ok).length;
+    res.status(200).json({
       status: 'success',
-      code: 'PROCESAMIENTO_INICIADO',
-      data: {
-        folio,
-        total: archivos.length,
-        mensaje: 'Procesamiento iniciado en background. Hacé polling de revision-stats / listArchivos para ver el progreso.',
-      },
-    });
-
-    // Loop en background — fire and forget.
-    // Cada error de archivo se persiste en BBDD; un error inesperado del loop
-    // se loggea pero no rompe la instancia.
-    setImmediate(async () => {
-      const minimalReq = { headers: { authorization: authHeader } };
-      try {
-        for (const a of archivos) {
-          await procesarArchivo(minimalReq, a, folio);
-        }
-        loggingService.info('procesamiento background OK', { folio, total: archivos.length });
-      } catch (e) {
-        loggingService.error('procesamiento background falló', { folio, error: e.message });
-      }
+      data: { folio, total: resultados.length, exitosos, fallidos: resultados.length - exitosos, resultados },
     });
   } catch (err) {
     loggingService.error('procesar estudio failed', { folio, error: err.message });
