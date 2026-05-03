@@ -193,6 +193,19 @@ class DatabaseService {
       sets.push(`${key} = $${params.length}`);
     }
     if (!sets.length) return null;
+
+    // Si el letrado setea id_clasificacion manualmente y el archivo está
+    // atascado en un estado pre-clasificación ('recibido' / 'clasificando'),
+    // lo promovemos a 'clasificado' automáticamente. Esto destraba archivos
+    // que el clasificador no pudo actualizar (ej. Eventarc no llegó a la BBDD).
+    const cambiaTipo = fields.id_clasificacion != null;
+    const fuerzaEstado = fields.estado_procesamiento != null;
+    if (cambiaTipo && !fuerzaEstado) {
+      sets.push(
+        `estado_procesamiento = CASE WHEN estado_procesamiento IN ('recibido','clasificando') THEN 'clasificado' ELSE estado_procesamiento END`
+      );
+    }
+
     params.push(idArchivo);
     const sql = `UPDATE dt_archivos SET ${sets.join(', ')}, fecha_actualizacion = NOW() WHERE id_archivo = $${params.length} RETURNING *`;
     const { rows } = await pool.query(sql, params);
