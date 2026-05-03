@@ -82,6 +82,21 @@ router.get('/:folio/archivos', async (req, res) => {
   }
 });
 
+// Archivo individual + sus extracciones (para el visor)
+router.get('/:folio/archivos/:fileId', async (req, res) => {
+  try {
+    const fileId = parseInt(req.params.fileId, 10);
+    const archivo = await databaseService.getArchivoConExtracciones(req.params.folio, fileId);
+    if (!archivo) {
+      return res.status(404).json({ status: 'error', code: 'NOT_FOUND', message: 'Archivo no encontrado en este expediente.' });
+    }
+    res.status(200).json({ status: 'success', data: archivo });
+  } catch (err) {
+    loggingService.error('Error fetching archivo', { fileId: req.params.fileId, error: err.message });
+    res.status(500).json({ status: 'error', code: 'FETCH_FILE_FAILED', message: err.message });
+  }
+});
+
 router.patch('/:folio/archivos/:fileId', async (req, res) => {
   try {
     const updated = await databaseService.updateArchivoMetadata(req.params.fileId, req.body);

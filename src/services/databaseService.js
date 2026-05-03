@@ -148,6 +148,27 @@ class DatabaseService {
     return rows;
   }
 
+  // Archivo individual con sus extracciones (para el visor de documento).
+  async getArchivoConExtracciones(folio, idArchivo) {
+    const archivoQ = await pool.query(
+      `SELECT a.*, cl.codigo AS clasificacion_codigo, cl.nombre AS clasificacion_nombre,
+              cl.categoria AS clasificacion_categoria, cl.emisor AS clasificacion_emisor
+       FROM dt_archivos a
+       INNER JOIN dt_estudio e        ON e.id_estudio = a.id_estudio
+       LEFT JOIN dt_clasificaciones cl ON cl.id = a.id_clasificacion
+       WHERE e.folio = $1 AND a.id_archivo = $2 AND a.eliminado = FALSE`,
+      [folio, idArchivo]
+    );
+    if (!archivoQ.rows[0]) return null;
+    const extQ = await pool.query(
+      `SELECT id_extraccion, schema_codigo, datos, spans, confianza, fecha
+       FROM dt_extraccion WHERE id_archivo = $1
+       ORDER BY fecha DESC`,
+      [idArchivo]
+    );
+    return { ...archivoQ.rows[0], extracciones: extQ.rows };
+  }
+
   async registerArchivo({ folio, nombre, gcsPath, mimeType, sizeBytes, sha256 }) {
     const sql = `
       INSERT INTO dt_archivos (
