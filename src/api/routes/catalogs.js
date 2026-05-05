@@ -33,9 +33,9 @@ router.get('/estados', async (_req, res) => {
   }
 });
 
-router.get('/clientes', async (_req, res) => {
+router.get('/clientes', async (req, res) => {
   try {
-    const data = await databaseService.listClientes();
+    const data = await databaseService.listClientes(req.tenantId);
     res.status(200).json({ status: 'success', data });
   } catch (err) {
     res.status(500).json({ status: 'error', code: 'LIST_CLIENTES_FAILED', message: err.message });

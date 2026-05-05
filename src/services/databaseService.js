@@ -19,9 +19,11 @@ const loggingService = require('./loggingService');
 class DatabaseService {
   /* ─────────────────────── ESTUDIOS ─────────────────────── */
 
-  async listEstudios({ estado, search, limit = 50, offset = 0 } = {}) {
+  async listEstudios({ tenantId, estado, search, limit = 50, offset = 0 } = {}) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const where = ['e.eliminado = FALSE'];
-    const params = [];
+    const params = [tenantId];
+    where.push(`e.id_tenant = $${params.length}`);
 
     if (estado) {
       params.push(estado);
@@ -72,31 +74,34 @@ class DatabaseService {
     return rows;
   }
 
-  async getEstudioByFolio(folio) {
+  async getEstudioByFolio(folio, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const sql = `
       SELECT e.*, ee.codigo AS estado_codigo, ee.nombre AS estado_nombre,
              c.nombre AS cliente_nombre, c.tipo AS cliente_tipo
       FROM dt_estudio e
       LEFT JOIN dt_estados_estudio ee ON ee.id = e.id_estado
       LEFT JOIN dt_clientes c        ON c.id_cliente = e.id_cliente
-      WHERE e.folio = $1 AND e.eliminado = FALSE
+      WHERE e.folio = $1 AND e.id_tenant = $2 AND e.eliminado = FALSE
     `;
-    const { rows } = await pool.query(sql, [folio]);
+    const { rows } = await pool.query(sql, [folio, tenantId]);
     return rows[0] || null;
   }
 
-  async createEstudio(data, emailLetrado) {
-    const folio = await this._generateFolio();
+  async createEstudio(data, emailLetrado, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
+    const folio = await this._generateFolio(tenantId);
     const sql = `
       INSERT INTO dt_estudio (
-        folio, rol_sii, direccion, comuna, region, encargo, plazo_dias,
+        id_tenant, folio, rol_sii, direccion, comuna, region, encargo, plazo_dias,
         id_cliente, email_letrado, fecha_apertura, fecha_creacion, id_estado
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW(),
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW(),
         (SELECT id FROM dt_estados_estudio WHERE codigo = 'borrador'))
       RETURNING *
     `;
     const params = [
+      tenantId,
       folio,
       data.rol_sii,
       data.direccion,
@@ -111,23 +116,29 @@ class DatabaseService {
     return rows[0];
   }
 
-  async updateEstudioStatus(folio, estadoCodigo, emailLetrado) {
+  async updateEstudioStatus(folio, estadoCodigo, emailLetrado, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const sql = `
       UPDATE dt_estudio
       SET id_estado = (SELECT id FROM dt_estados_estudio WHERE codigo = $1),
           fecha_actualizacion = NOW()
-      WHERE folio = $2 AND email_letrado = $3
+      WHERE folio = $2 AND email_letrado = $3 AND id_tenant = $4
       RETURNING *
     `;
-    const { rows } = await pool.query(sql, [estadoCodigo, folio, emailLetrado]);
+    const { rows } = await pool.query(sql, [estadoCodigo, folio, emailLetrado, tenantId]);
     return rows[0];
   }
 
-  async _generateFolio() {
+  // El folio es UNIQUE(id_tenant, folio) — debemos contar por tenant para
+  // que cada despacho tenga su propia secuencia EH-YYYY-NNNN sin colisiones
+  // y sin "saltar" números porque otro tenant los usó.
+  async _generateFolio(tenantId) {
     const year = new Date().getFullYear();
     const { rows } = await pool.query(
-      `SELECT COUNT(*)::int + 1 AS next FROM dt_estudio WHERE EXTRACT(YEAR FROM fecha_creacion) = $1`,
-      [year]
+      `SELECT COUNT(*)::int + 1 AS next
+       FROM dt_estudio
+       WHERE id_tenant = $1 AND EXTRACT(YEAR FROM fecha_creacion) = $2`,
+      [tenantId, year]
     );
     const next = String(rows[0].next).padStart(4, '0');
     return `EH-${year}-${next}`;
@@ -135,55 +146,60 @@ class DatabaseService {
 
   /* ─────────────────────── ARCHIVOS ─────────────────────── */
 
-  async listArchivos(folio) {
+  async listArchivos(folio, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const sql = `
       SELECT a.*, cl.codigo AS clasificacion_codigo, cl.nombre AS clasificacion_nombre
       FROM dt_archivos a
       INNER JOIN dt_estudio e        ON e.id_estudio = a.id_estudio
       LEFT JOIN dt_clasificaciones cl ON cl.id = a.id_clasificacion
-      WHERE e.folio = $1 AND a.eliminado = FALSE
+      WHERE e.folio = $1 AND e.id_tenant = $2 AND a.eliminado = FALSE
       ORDER BY a.fecha_subida DESC
     `;
-    const { rows } = await pool.query(sql, [folio]);
+    const { rows } = await pool.query(sql, [folio, tenantId]);
     return rows;
   }
 
   // Archivo individual con sus extracciones (para el visor de documento).
-  async getArchivoConExtracciones(folio, idArchivo) {
+  async getArchivoConExtracciones(folio, idArchivo, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const archivoQ = await pool.query(
       `SELECT a.*, cl.codigo AS clasificacion_codigo, cl.nombre AS clasificacion_nombre,
               cl.categoria AS clasificacion_categoria, cl.emisor AS clasificacion_emisor
        FROM dt_archivos a
        INNER JOIN dt_estudio e        ON e.id_estudio = a.id_estudio
        LEFT JOIN dt_clasificaciones cl ON cl.id = a.id_clasificacion
-       WHERE e.folio = $1 AND a.id_archivo = $2 AND a.eliminado = FALSE`,
-      [folio, idArchivo]
+       WHERE e.folio = $1 AND a.id_archivo = $2
+         AND e.id_tenant = $3 AND a.eliminado = FALSE`,
+      [folio, idArchivo, tenantId]
     );
     if (!archivoQ.rows[0]) return null;
     const extQ = await pool.query(
       `SELECT id_extraccion, schema_codigo, datos, spans, confianza, fecha
-       FROM dt_extraccion WHERE id_archivo = $1
+       FROM dt_extraccion WHERE id_archivo = $1 AND id_tenant = $2
        ORDER BY fecha DESC`,
-      [idArchivo]
+      [idArchivo, tenantId]
     );
     return { ...archivoQ.rows[0], extracciones: extQ.rows };
   }
 
-  async registerArchivo({ folio, nombre, gcsPath, mimeType, sizeBytes, sha256 }) {
+  async registerArchivo({ folio, nombre, gcsPath, mimeType, sizeBytes, sha256, tenantId }) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const sql = `
       INSERT INTO dt_archivos (
-        id_estudio, nombre, gcs_path, mime_type, size_bytes, sha256,
+        id_tenant, id_estudio, nombre, gcs_path, mime_type, size_bytes, sha256,
         estado_procesamiento, eliminado, fecha_subida
       )
-      SELECT id_estudio, $2, $3, $4, $5, $6, 'recibido', FALSE, NOW()
-      FROM dt_estudio WHERE folio = $1
+      SELECT id_tenant, id_estudio, $3, $4, $5, $6, $7, 'recibido', FALSE, NOW()
+      FROM dt_estudio WHERE folio = $1 AND id_tenant = $2
       RETURNING *
     `;
-    const { rows } = await pool.query(sql, [folio, nombre, gcsPath, mimeType, sizeBytes, sha256]);
+    const { rows } = await pool.query(sql, [folio, tenantId, nombre, gcsPath, mimeType, sizeBytes, sha256]);
     return rows[0];
   }
 
-  async updateArchivoMetadata(idArchivo, fields) {
+  async updateArchivoMetadata(idArchivo, fields, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const allowed = ['id_clasificacion', 'estado_procesamiento', 'estado_revision', 'observacion'];
     const sets = [];
     const params = [];
@@ -207,15 +223,20 @@ class DatabaseService {
     }
 
     params.push(idArchivo);
-    const sql = `UPDATE dt_archivos SET ${sets.join(', ')}, fecha_actualizacion = NOW() WHERE id_archivo = $${params.length} RETURNING *`;
+    params.push(tenantId);
+    const sql = `UPDATE dt_archivos SET ${sets.join(', ')}, fecha_actualizacion = NOW()
+                 WHERE id_archivo = $${params.length - 1} AND id_tenant = $${params.length}
+                 RETURNING *`;
     const { rows } = await pool.query(sql, params);
     return rows[0];
   }
 
-  async softDeleteArchivo(idArchivo) {
+  async softDeleteArchivo(idArchivo, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     await pool.query(
-      `UPDATE dt_archivos SET eliminado = TRUE, fecha_actualizacion = NOW() WHERE id_archivo = $1`,
-      [idArchivo]
+      `UPDATE dt_archivos SET eliminado = TRUE, fecha_actualizacion = NOW()
+       WHERE id_archivo = $1 AND id_tenant = $2`,
+      [idArchivo, tenantId]
     );
   }
 
@@ -236,62 +257,70 @@ class DatabaseService {
   // Devuelve los archivos del estudio listos para extracción:
   // estado_revision='aprobado', estado_procesamiento NO en ('extrayendo','procesado'),
   // y con id_clasificacion seteado.
-  async listArchivosListosParaExtraer(folio) {
+  async listArchivosListosParaExtraer(folio, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const { rows } = await pool.query(
       `SELECT a.id_archivo, a.nombre, a.gcs_path, cl.codigo AS clasificacion_codigo
        FROM dt_archivos a
        JOIN dt_estudio e        ON e.id_estudio = a.id_estudio
        JOIN dt_clasificaciones cl ON cl.id = a.id_clasificacion
-       WHERE e.folio = $1
+       WHERE e.folio = $1 AND e.id_tenant = $2
          AND a.eliminado = FALSE
          AND a.estado_revision = 'aprobado'
          AND a.estado_procesamiento NOT IN ('extrayendo','procesado')`,
-      [folio]
+      [folio, tenantId]
     );
     return rows;
   }
 
   // Devuelve un archivo concreto si existe, está aprobado y tiene clasificación.
   // Usado por el endpoint de reprocesamiento individual.
-  async getArchivoParaExtraer(folio, idArchivo) {
+  async getArchivoParaExtraer(folio, idArchivo, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const { rows } = await pool.query(
       `SELECT a.id_archivo, a.nombre, a.gcs_path, cl.codigo AS clasificacion_codigo
        FROM dt_archivos a
        JOIN dt_estudio e        ON e.id_estudio = a.id_estudio
        JOIN dt_clasificaciones cl ON cl.id = a.id_clasificacion
-       WHERE e.folio = $1
+       WHERE e.folio = $1 AND e.id_tenant = $3
          AND a.id_archivo = $2
          AND a.eliminado = FALSE
          AND a.estado_revision = 'aprobado'`,
-      [folio, idArchivo]
+      [folio, idArchivo, tenantId]
     );
     return rows[0] || null;
   }
 
   // Marca un archivo como 'extrayendo'. Permite reprocesar archivos en estado
   // 'procesado' o 'error' — solo bloquea si ya está corriendo (otra ejecución
-  // en paralelo).
-  async markArchivoExtrayendo(idArchivo) {
+  // en paralelo). Defense-in-depth: filtra por tenant aunque el caller ya
+  // resolvió el archivo vía getArchivoParaExtraer.
+  async markArchivoExtrayendo(idArchivo, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     await pool.query(
       `UPDATE dt_archivos SET estado_procesamiento='extrayendo', fecha_actualizacion=NOW()
-       WHERE id_archivo=$1 AND estado_procesamiento != 'extrayendo'`,
-      [idArchivo]
+       WHERE id_archivo=$1 AND id_tenant=$2 AND estado_procesamiento != 'extrayendo'`,
+      [idArchivo, tenantId]
     );
   }
 
-  async markArchivoProcesado(idArchivo, ok = true) {
+  async markArchivoProcesado(idArchivo, ok = true, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     await pool.query(
       `UPDATE dt_archivos SET estado_procesamiento=$2, fecha_actualizacion=NOW()
-       WHERE id_archivo=$1`,
-      [idArchivo, ok ? 'procesado' : 'error']
+       WHERE id_archivo=$1 AND id_tenant=$3`,
+      [idArchivo, ok ? 'procesado' : 'error', tenantId]
     );
   }
 
   // Recovery: archivos en 'extrayendo' por más de N minutos se asumen como
   // huérfanos (la instancia que los procesaba murió). Los marcamos 'error'
   // para que el letrado pueda reintentarlos manualmente.
-  // Si folio es null, barre todos los estudios.
-  async resetArchivosAtascados(folio, minutos = 15) {
+  // tenantId es OBLIGATORIO: el letrado solo puede destrabar archivos de su
+  // propio tenant. El sweep cross-tenant queda como tarea de mantenimiento
+  // operacional (job cron con SA elevado), no expuesto via HTTP.
+  async resetArchivosAtascados(folio, minutos = 15, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const interval = `${parseInt(minutos, 10) || 15} minutes`;
     if (folio) {
       const { rowCount } = await pool.query(
@@ -302,12 +331,33 @@ class DatabaseService {
          FROM dt_estudio e
          WHERE e.id_estudio = a.id_estudio
            AND e.folio = $1
+           AND e.id_tenant = $2
            AND a.estado_procesamiento = 'extrayendo'
            AND a.fecha_actualizacion < NOW() - INTERVAL '${interval}'`,
-        [folio]
+        [folio, tenantId]
       );
       return rowCount;
     }
+    const { rowCount } = await pool.query(
+      `UPDATE dt_archivos
+       SET estado_procesamiento = 'error',
+           observacion = COALESCE(observacion, '') || ' [recovery: instancia caída]',
+           fecha_actualizacion = NOW()
+       WHERE id_tenant = $1
+         AND estado_procesamiento = 'extrayendo'
+         AND fecha_actualizacion < NOW() - INTERVAL '${interval}'`,
+      [tenantId]
+    );
+    return rowCount;
+  }
+
+  // Recovery operacional cross-tenant — SOLO para uso del loader al
+  // arrancar la instancia. NO exponer via HTTP. La razón de ser un método
+  // separado es que `resetArchivosAtascados` (con tenant) garantiza que
+  // ningún path HTTP pueda accidentalmente barrer estudios de otros
+  // despachos. Aquí es system-scoped y por eso lleva sufijo explícito.
+  async resetArchivosAtascadosSystemWide(minutos = 15) {
+    const interval = `${parseInt(minutos, 10) || 15} minutes`;
     const { rowCount } = await pool.query(
       `UPDATE dt_archivos
        SET estado_procesamiento = 'error',
@@ -320,7 +370,8 @@ class DatabaseService {
   }
 
   // Para chequeos de "todos están aprobados" antes de habilitar el botón.
-  async getArchivosRevisionStats(folio) {
+  async getArchivosRevisionStats(folio, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const { rows } = await pool.query(
       `SELECT
          COUNT(*) FILTER (WHERE a.eliminado = FALSE)                          AS total,
@@ -330,15 +381,16 @@ class DatabaseService {
          COUNT(*) FILTER (WHERE a.eliminado = FALSE AND a.estado_revision = 'rechazado')  AS rechazados
        FROM dt_archivos a
        JOIN dt_estudio e ON e.id_estudio = a.id_estudio
-       WHERE e.folio = $1`,
-      [folio]
+       WHERE e.folio = $1 AND e.id_tenant = $2`,
+      [folio, tenantId]
     );
     return rows[0] || { total: 0, aprobados: 0, pendientes: 0, observados: 0, rechazados: 0 };
   }
 
   /* ──────────────────── DOCUMENTOS SOLICITADOS ──────────────────── */
 
-  async listDocumentosSolicitados(folio) {
+  async listDocumentosSolicitados(folio, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const { rows } = await pool.query(
       `SELECT
          ds.id_solicitud,
@@ -361,26 +413,28 @@ class DatabaseService {
        JOIN dt_clasificaciones c  ON c.id = ds.id_clasificacion
        LEFT JOIN dt_archivos a_origen   ON a_origen.id_archivo = ds.id_archivo_origen
        LEFT JOIN dt_archivos a_resuelto ON a_resuelto.id_archivo = ds.id_archivo_resuelto
-       WHERE e.folio = $1
+       WHERE e.folio = $1 AND e.id_tenant = $2
        ORDER BY ds.fecha_creacion DESC`,
-      [folio]
+      [folio, tenantId]
     );
     return rows;
   }
 
-  async updateSolicitudEstado(idSolicitud, estado, idArchivoResuelto = null) {
+  async updateSolicitudEstado(idSolicitud, estado, idArchivoResuelto = null, tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const { rows } = await pool.query(
       `UPDATE dt_documentos_solicitados
           SET estado = $2,
               id_archivo_resuelto = $3,
               fecha_resolucion = CASE WHEN $2 IN ('subido','descartado') THEN NOW() ELSE NULL END
-        WHERE id_solicitud = $1
+        WHERE id_solicitud = $1 AND id_tenant = $4
         RETURNING *`,
-      [idSolicitud, estado, idArchivoResuelto]
+      [idSolicitud, estado, idArchivoResuelto, tenantId]
     );
     return rows[0] || null;
   }
 
+  // dt_estados_estudio es catálogo global — sin tenant.
   async listEstados() {
     const { rows } = await pool.query(
       'SELECT id, codigo, nombre FROM dt_estados_estudio ORDER BY orden'
@@ -388,11 +442,29 @@ class DatabaseService {
     return rows;
   }
 
-  async listClientes() {
+  // dt_clientes ahora es por tenant — cada despacho ve sus propios mandantes.
+  async listClientes(tenantId) {
+    if (tenantId == null) throw new Error('tenantId es requerido');
     const { rows } = await pool.query(
-      'SELECT id_cliente, nombre, rut, tipo FROM dt_clientes WHERE eliminado = FALSE ORDER BY nombre'
+      `SELECT id_cliente, nombre, rut, tipo
+       FROM dt_clientes
+       WHERE id_tenant = $1 AND eliminado = FALSE
+       ORDER BY nombre`,
+      [tenantId]
     );
     return rows;
+  }
+
+  /* ──────────────────── AUTORIZACIÓN ──────────────────── */
+
+  /** Lookup mínimo para validar tenant antes de firmar URLs. */
+  async findArchivoByGcsPath(gcsPath) {
+    const { rows } = await pool.query(
+      `SELECT id_archivo, id_estudio, id_tenant, eliminado
+       FROM dt_archivos WHERE gcs_path = $1`,
+      [gcsPath]
+    );
+    return rows[0] || null;
   }
 
   /* ──────────────────── HASH UTIL ──────────────────── */

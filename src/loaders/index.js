@@ -10,7 +10,7 @@ module.exports = async (app) => {
   // por Cloud Run), los marcamos 'error' para que el letrado pueda
   // reintentarlos manualmente. Idempotente.
   try {
-    const limpiados = await databaseService.resetArchivosAtascados(null, 15);
+    const limpiados = await databaseService.resetArchivosAtascadosSystemWide(15);
     if (limpiados > 0) {
       loggingService.info('Recovery startup: archivos atascados marcados error', { count: limpiados });
     }

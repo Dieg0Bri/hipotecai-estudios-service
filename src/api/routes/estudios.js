@@ -19,6 +19,7 @@ router.get('/', async (req, res) => {
   try {
     const { estado, search, limit, offset } = req.query;
     const estudios = await databaseService.listEstudios({
+      tenantId: req.tenantId,
       estado,
       search,
       limit: limit ? parseInt(limit, 10) : 50,
@@ -33,7 +34,7 @@ router.get('/', async (req, res) => {
 
 router.get('/:folio', async (req, res) => {
   try {
-    const estudio = await databaseService.getEstudioByFolio(req.params.folio);
+    const estudio = await databaseService.getEstudioByFolio(req.params.folio, req.tenantId);
     if (!estudio) return res.status(404).json({ status: 'error', code: 'NOT_FOUND', message: 'Estudio no encontrado.' });
     res.status(200).json({ status: 'success', data: estudio });
   } catch (err) {
@@ -50,7 +51,7 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ status: 'error', code: 'MISSING_FIELD', message: `Falta ${field}` });
       }
     }
-    const estudio = await databaseService.createEstudio(req.body, req.user.email);
+    const estudio = await databaseService.createEstudio(req.body, req.user.email, req.tenantId);
     loggingService.info('Estudio creado', { folio: estudio.folio, letrado: req.user.email });
     res.status(201).json({ status: 'success', data: estudio, message: 'Expediente abierto.' });
   } catch (err) {
@@ -63,7 +64,9 @@ router.put('/:folio/status', async (req, res) => {
   try {
     const { estado } = req.body;
     if (!estado) return res.status(400).json({ status: 'error', code: 'MISSING_ESTADO', message: 'estado requerido' });
-    const updated = await databaseService.updateEstudioStatus(req.params.folio, estado, req.user.email);
+    const updated = await databaseService.updateEstudioStatus(
+      req.params.folio, estado, req.user.email, req.tenantId,
+    );
     if (!updated) return res.status(404).json({ status: 'error', code: 'NOT_FOUND', message: 'Estudio no encontrado o sin permiso.' });
     res.status(200).json({ status: 'success', data: updated });
   } catch (err) {
@@ -74,7 +77,7 @@ router.put('/:folio/status', async (req, res) => {
 
 router.get('/:folio/archivos', async (req, res) => {
   try {
-    const archivos = await databaseService.listArchivos(req.params.folio);
+    const archivos = await databaseService.listArchivos(req.params.folio, req.tenantId);
     res.status(200).json({ status: 'success', data: archivos, count: archivos.length });
   } catch (err) {
     loggingService.error('Error listing archivos', { folio: req.params.folio, error: err.message });
@@ -86,7 +89,9 @@ router.get('/:folio/archivos', async (req, res) => {
 router.get('/:folio/archivos/:fileId', async (req, res) => {
   try {
     const fileId = parseInt(req.params.fileId, 10);
-    const archivo = await databaseService.getArchivoConExtracciones(req.params.folio, fileId);
+    const archivo = await databaseService.getArchivoConExtracciones(
+      req.params.folio, fileId, req.tenantId,
+    );
     if (!archivo) {
       return res.status(404).json({ status: 'error', code: 'NOT_FOUND', message: 'Archivo no encontrado en este expediente.' });
     }
@@ -99,7 +104,9 @@ router.get('/:folio/archivos/:fileId', async (req, res) => {
 
 router.patch('/:folio/archivos/:fileId', async (req, res) => {
   try {
-    const updated = await databaseService.updateArchivoMetadata(req.params.fileId, req.body);
+    const updated = await databaseService.updateArchivoMetadata(
+      req.params.fileId, req.body, req.tenantId,
+    );
     if (!updated) return res.status(404).json({ status: 'error', code: 'NOT_FOUND', message: 'Archivo no encontrado.' });
     res.status(200).json({ status: 'success', data: updated });
   } catch (err) {
@@ -110,7 +117,7 @@ router.patch('/:folio/archivos/:fileId', async (req, res) => {
 
 router.delete('/:folio/archivos/:fileId', async (req, res) => {
   try {
-    await databaseService.softDeleteArchivo(req.params.fileId);
+    await databaseService.softDeleteArchivo(req.params.fileId, req.tenantId);
     res.status(200).json({ status: 'success', message: 'Archivo eliminado.' });
   } catch (err) {
     loggingService.error('Error deleting archivo', { error: err.message });
@@ -122,7 +129,7 @@ router.delete('/:folio/archivos/:fileId', async (req, res) => {
 // habilitar/deshabilitar el botón "Procesar todo").
 router.get('/:folio/revision-stats', async (req, res) => {
   try {
-    const stats = await databaseService.getArchivosRevisionStats(req.params.folio);
+    const stats = await databaseService.getArchivosRevisionStats(req.params.folio, req.tenantId);
     const total = parseInt(stats.total, 10) || 0;
     const aprobados = parseInt(stats.aprobados, 10) || 0;
     const procesable = total > 0 && aprobados === total;
@@ -156,7 +163,7 @@ async function pMap(items, mapper, concurrency) {
 // Marca estado en BBDD (extrayendo → procesado/error). Devuelve resumen.
 async function procesarArchivo(req, archivo, folio) {
   const config = require('../../../config');
-  await databaseService.markArchivoExtrayendo(archivo.id_archivo);
+  await databaseService.markArchivoExtrayendo(archivo.id_archivo, req.tenantId);
   const url = `${config.documentosApiUrl.replace(/\/$/, '')}/extract-from-gcs`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), config.documentosApiTimeoutMs);
@@ -176,10 +183,10 @@ async function procesarArchivo(req, archivo, folio) {
       signal: ctrl.signal,
     });
     const ok = resp.ok;
-    await databaseService.markArchivoProcesado(archivo.id_archivo, ok);
+    await databaseService.markArchivoProcesado(archivo.id_archivo, ok, req.tenantId);
     return { id_archivo: archivo.id_archivo, nombre: archivo.nombre, ok, status: resp.status };
   } catch (e) {
-    await databaseService.markArchivoProcesado(archivo.id_archivo, false);
+    await databaseService.markArchivoProcesado(archivo.id_archivo, false, req.tenantId);
     return { id_archivo: archivo.id_archivo, nombre: archivo.nombre, ok: false, error: e.message };
   } finally {
     clearTimeout(t);
@@ -198,7 +205,7 @@ async function procesarArchivo(req, archivo, folio) {
 router.post('/:folio/procesar', async (req, res) => {
   const folio = req.params.folio;
   try {
-    const stats = await databaseService.getArchivosRevisionStats(folio);
+    const stats = await databaseService.getArchivosRevisionStats(folio, req.tenantId);
     const total = parseInt(stats.total, 10) || 0;
     const aprobados = parseInt(stats.aprobados, 10) || 0;
     if (total === 0) {
@@ -221,7 +228,7 @@ router.post('/:folio/procesar', async (req, res) => {
       });
     }
 
-    const archivos = await databaseService.listArchivosListosParaExtraer(folio);
+    const archivos = await databaseService.listArchivosListosParaExtraer(folio, req.tenantId);
     // Paralelo con concurrencia 5: 27 archivos × 30s ≈ 3 min total (en serie
     // serían 13.5 min y excederían el timeout de Cloud Run). Si Gemini empieza
     // a rate-limitar, bajar a 3.
@@ -243,7 +250,7 @@ router.post('/:folio/procesar', async (req, res) => {
 router.post('/:folio/limpiar-extrayendo', async (req, res) => {
   try {
     const minutos = parseInt(req.query.minutos, 10) || 15;
-    const limpiados = await databaseService.resetArchivosAtascados(req.params.folio, minutos);
+    const limpiados = await databaseService.resetArchivosAtascados(req.params.folio, minutos, req.tenantId);
     res.status(200).json({ status: 'success', data: { folio: req.params.folio, limpiados, minutos } });
   } catch (err) {
     res.status(500).json({ status: 'error', code: 'LIMPIAR_FAILED', message: err.message });
@@ -265,7 +272,7 @@ router.post('/:folio/archivos/:fileId/procesar', async (req, res) => {
       });
     }
 
-    const a = await databaseService.getArchivoParaExtraer(folio, fileId);
+    const a = await databaseService.getArchivoParaExtraer(folio, fileId, req.tenantId);
     if (!a) {
       return res.status(404).json({
         status: 'error',
@@ -286,7 +293,7 @@ router.post('/:folio/archivos/:fileId/procesar', async (req, res) => {
 // del clasificador). UI los muestra como "te falta subir X por la condición Y".
 router.get('/:folio/documentos-solicitados', async (req, res) => {
   try {
-    const data = await databaseService.listDocumentosSolicitados(req.params.folio);
+    const data = await databaseService.listDocumentosSolicitados(req.params.folio, req.tenantId);
     res.status(200).json({ status: 'success', data, count: data.length });
   } catch (err) {
     loggingService.error('Error listing documentos solicitados', {
@@ -303,7 +310,7 @@ router.patch('/:folio/documentos-solicitados/:idSolicitud', async (req, res) => 
       return res.status(400).json({ status: 'error', code: 'BAD_ESTADO', message: 'estado inválido' });
     }
     const updated = await databaseService.updateSolicitudEstado(
-      req.params.idSolicitud, estado, id_archivo_resuelto || null,
+      req.params.idSolicitud, estado, id_archivo_resuelto || null, req.tenantId,
     );
     if (!updated) return res.status(404).json({ status: 'error', code: 'NOT_FOUND', message: 'Solicitud no encontrada' });
     res.status(200).json({ status: 'success', data: updated });
